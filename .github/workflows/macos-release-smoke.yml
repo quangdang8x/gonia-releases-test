@@ -1,0 +1,119 @@
+# macos-release-smoke.yml — every release, on real Macs (Apple Silicon AND Intel).
+#
+# SOURCE OF TRUTH: this file in the Gonia repo. The releases repo (GitHub, public, binaries only)
+# carries a COPY at .github/workflows/macos-release-smoke.yml — paste it there through the web UI
+# after changing it here. agent-distribution.md §4.6 (T5).
+#
+# Why GitHub: standard runners are free and unlimited on public repositories and include Apple
+# Silicon (macos-15) — Azure's hosted macOS image is Intel only. The releases repo holds no source,
+# so this tests what users get: the signed release, the installer, the binary, self-update and the
+# launchd plist. The Go test suite on macOS needs the source and runs elsewhere (Azure, T5).
+#
+# Safety on a public repo: no secrets, read-only token, no third-party actions, and only the
+# `release` and manual triggers — nothing a pull request from a stranger can start.
+name: macOS release smoke
+
+on:
+  release:
+    types: [published]          # the Azure pipeline creates it with a PAT, which does trigger this
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to test (e.g. v0.1.1112)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      REL: https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name || inputs.tag }}
+      # the release signing PUBLIC key (infrastructure/deploy/get/minisign.pub) — public by design
+      PUBKEY: RWTCCAn6NfxvPFYqn68RA0Vh1W4/7e0/ZNxyNeuVDYKo2gAcS2lzB6si
+      GET: https://test.get.gonia.vietcit.com
+    steps:
+      - name: Machine
+        run: |
+          sw_vers
+          echo "arch: $(uname -m)  tag: $TAG"
+
+      # assets can land a little after the release event; wait for the signature, then verify it
+      - name: Release signature (minisign)
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            curl -fsSL -o SHA256SUMS.minisig "$REL/SHA256SUMS.minisig" && break
+            echo "waiting for release assets ($i)"; sleep 15
+          done
+          curl -fsSL -o SHA256SUMS "$REL/SHA256SUMS"
+          brew install minisign >/dev/null
+          minisign -Vm SHA256SUMS -P "$PUBKEY"
+
+      # the real installer on real macOS tools (BSD grep/awk, shasum), pointed at THIS release
+      - name: Install this release with install.sh
+        run: |
+          set -euo pipefail
+          curl -fsSL "$GET/install.sh" | GONIA_INSTALL_BASE="$REL" GONIA_INSTALL_DIR="$PWD/rel" sh
+          ./rel/gonia version
+          ./rel/gonia version | grep -qx "gonia ${TAG#v}"
+
+      # Apple Silicon refuses to exec an unsigned or mis-signed binary ("Killed: 9"); the Go linker
+      # signs darwin/arm64 ad hoc. Intel binaries carry no signature and need none.
+      - name: Code signature
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" = arm64 ]; then
+            codesign --verify --strict --verbose=2 ./rel/gonia
+            codesign -dv ./rel/gonia 2>&1 | grep -E "Signature=adhoc|Identifier|Format"
+          else
+            codesign -dv ./rel/gonia 2>&1 || echo "unsigned (expected on Intel)"
+          fi
+
+      - name: Station service — launchd plist
+        run: |
+          set -euo pipefail
+          ./rel/gonia install --host --print > station.plist
+          plutil -lint station.plist
+          cat station.plist
+
+      - name: Update command refuses what it does not understand
+        run: |
+          set -euo pipefail
+          ./rel/gonia update --help | head -1
+          if ./rel/gonia update --bogus; then echo "unknown argument was accepted"; exit 1; fi
+
+      # Self-update on macOS: the PREVIOUS release updates itself to THIS one (its own signature and
+      # SHA256 checks), and the replaced file must still run — on Apple Silicon a file rewritten in
+      # place, rather than swapped, is killed on its next exec. "Previous" is taken from the release
+      # list, not the stable channel: once stable is promoted to this tag it would update to itself.
+      - name: Self-update from the previous release to this one
+        env:
+          GH_API_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PREV="$(curl -fsSL -H "Authorization: Bearer $GH_API_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=30" | python3 -c '
+          import json, os, sys
+          def ver(t):
+              try: return tuple(int(x) for x in t.lstrip("v").split("."))
+              except ValueError: return None
+          me = ver(os.environ["TAG"])
+          older = [r["tag_name"] for r in json.load(sys.stdin)
+                   if not r["draft"] and ver(r["tag_name"]) and ver(r["tag_name"]) < me]
+          print(max(older, key=ver) if older else "")')"
+          if [ -z "$PREV" ]; then echo "no earlier release to update from"; exit 0; fi
+          OLD="https://github.com/${{ github.repository }}/releases/download/$PREV"
+          curl -fsSL "$GET/install.sh" | GONIA_INSTALL_BASE="$OLD" GONIA_INSTALL_DIR="$PWD/old" sh
+          FROM="$(./old/gonia version)"
+          ./old/gonia update --url "$REL/manifest.json"
+          ./old/gonia version | grep -qx "gonia ${TAG#v}"
+          echo "updated: $FROM → $(./old/gonia version)"
